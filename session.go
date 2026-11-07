@@ -13,12 +13,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var errSessionUsed = errors.New("schemer: Wait already ran or the session is closed")
+
+// claimHook is a test seam that runs after the Wait handler claims a callback, before it answers.
+var claimHook func()
+
+// sentHook is a test seam that runs after the Wait handler answers, before it sends the result to Wait.
+var sentHook func()
 
 // maxExcerpt caps how much of a token response an error message carries.
 const maxExcerpt = 512
@@ -101,53 +109,110 @@ func (s *Session) Wait(ctx context.Context) (string, error) {
 	}
 	results := make(chan outcome, 1)
 
+	// Wait returns the result of the first callback that carries this session's state and arrives while Wait is open.
+	var (
+		mu                   sync.Mutex
+		open, claimed, ended bool
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if !s.ownsState(q.Get("state")) {
-			http.Error(w, ErrStateMismatch.Error(), http.StatusBadRequest)
+			reject(w, errStateMismatch)
 			return
 		}
 		code, err := s.codeFromQuery(q)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		} else {
-			io.WriteString(w, "ok")
+		mu.Lock()
+		gone := !open || ended
+		claim := !gone && !claimed
+		if claim {
+			claimed = true
 		}
-		select {
-		case results <- outcome{code: code, err: err}:
-		default:
+		mu.Unlock()
+		if gone {
+			answer(w, http.StatusGone, "")
+			return
+		}
+		if claim {
+			defer func() {
+				hook := sentHook
+				defer func() { results <- outcome{code: code, err: err} }()
+				if hook != nil {
+					hook()
+				}
+			}()
+			if claimHook != nil {
+				claimHook()
+			}
+		}
+		if err != nil {
+			reject(w, err)
+		} else {
+			answer(w, http.StatusOK, "ok")
 		}
 	})
+	giveUp := func(err error) (string, error) {
+		mu.Lock()
+		if claimed {
+			mu.Unlock()
+			r := <-results
+			return r.code, r.err
+		}
+		ended = true
+		mu.Unlock()
+		return "", err
+	}
 
 	if err := s.activate(mux); err != nil {
 		return "", err
 	}
+	mu.Lock()
+	open = true
+	mu.Unlock()
 	select {
 	case <-s.done:
-		return "", errSessionUsed
+		return giveUp(errSessionUsed)
+	case <-ctx.Done():
+		return giveUp(fmt.Errorf("schemer: waiting for the callback: %w", ctx.Err()))
 	default:
 	}
 
 	if err := s.open(s.AuthorizeURL()); err != nil {
-		return "", fmt.Errorf("schemer: opening the browser: %w", err)
+		return giveUp(fmt.Errorf("schemer: opening the browser: %w", err))
 	}
 
 	select {
 	case r := <-results:
 		return r.code, r.err
 	case <-ctx.Done():
-		return "", fmt.Errorf("schemer: waiting for the callback: %w", ctx.Err())
+		return giveUp(fmt.Errorf("schemer: waiting for the callback: %w", ctx.Err()))
 	case <-s.done:
-		return "", errSessionUsed
+		return giveUp(errSessionUsed)
 	}
+}
+
+// answer puts the whole response on the connection before it returns.
+func answer(w http.ResponseWriter, status int, body string) {
+	// Flush without a Content-Length sends the response chunked.
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	io.WriteString(w, body)
+	http.NewResponseController(w).Flush()
+}
+
+// reject answers 400 with the headers and body http.Error would write.
+func reject(w http.ResponseWriter, err error) {
+	h := w.Header()
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	answer(w, http.StatusBadRequest, err.Error()+"\n")
 }
 
 // ParseCallback returns the code from a callback URL obtained by hand.
 func (s *Session) ParseCallback(rawURL string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return "", fmt.Errorf("schemer: parsing callback URL: %w", err)
+		return "", fmt.Errorf("schemer: parsing callback URL: %w", parseCause(err))
 	}
 	return s.codeFromQuery(u.Query())
 }
@@ -183,31 +248,34 @@ func (s *Session) Exchange(ctx context.Context, code string) (*Token, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg := fmt.Sprintf("schemer: token endpoint returned %d", resp.StatusCode)
-		detail := excerpt(s.redact(errorText(body), code))
-		if detail == "" {
+		if len(body) == 0 {
 			return nil, errors.New(msg)
 		}
-		return nil, fmt.Errorf("%s: %s", msg, detail)
+		var v any
+		if json.Unmarshal(body, &v) != nil {
+			return nil, fmt.Errorf("%s (non-JSON body, %d bytes)", msg, len(body))
+		}
+		obj, _ := v.(map[string]any)
+		e, _ := obj["error"].(string)
+		desc, _ := obj["error_description"].(string)
+		return nil, s.tokenError(msg, e, desc, code)
 	}
 
 	var r struct {
 		Token
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		Error            json.RawMessage `json:"error"`
+		ErrorDescription json.RawMessage `json:"error_description"`
 	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("schemer: parsing the token response: %w", err)
+	if json.Unmarshal(body, &r) != nil {
+		return nil, fmt.Errorf("schemer: parsing the token response (HTTP 200, %d bytes)", len(body))
 	}
 	if r.AccessToken == "" {
 		const msg = "schemer: the token response has no access_token"
-		if r.Error == "" {
+		e := jsonString(r.Error)
+		if strings.TrimSpace(cleanText(e)) == "" {
 			return nil, errors.New(msg)
 		}
-		reason := r.Error
-		if r.ErrorDescription != "" {
-			reason += ": " + r.ErrorDescription
-		}
-		return nil, fmt.Errorf("%s: %s", msg, excerpt(s.redact(reason, code)))
+		return nil, s.tokenError(msg, e, jsonString(r.ErrorDescription), code)
 	}
 	t := r.Token
 	t.Raw = body
@@ -245,7 +313,7 @@ func (s *Session) acquireLocked(h http.Handler) error {
 	if err != nil {
 		return fmt.Errorf("schemer: binding callback listener: %w", err)
 	}
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	served := make(chan struct{})
 	s.server, s.served = srv, served
 	go func() {
@@ -312,14 +380,14 @@ func (s *Session) ownsState(state string) bool {
 
 func (s *Session) codeFromQuery(q url.Values) (string, error) {
 	if e := q.Get("error"); e != "" {
-		return "", &AuthError{Code: e, Description: q.Get("error_description")}
+		return "", newAuthError(e, q.Get("error_description"))
 	}
 	if !s.ownsState(q.Get("state")) {
-		return "", ErrStateMismatch
+		return "", errStateMismatch
 	}
 	code := q.Get("code")
 	if code == "" {
-		return "", ErrNoCode
+		return "", errNoCode
 	}
 	return code, nil
 }
@@ -347,23 +415,37 @@ func (s *Session) open(rawURL string) error {
 func (s *Session) redact(text, code string) string {
 	// In a single pass, a code that overlaps the verifier would leave part of the verifier unredacted.
 	text = strings.ReplaceAll(text, s.pkce.verifier, "[redacted]")
-	if code == "" {
-		return text
+	var pairs []string
+	clean := cleanText(code)
+	for _, form := range []string{code, url.QueryEscape(code), clean, strings.TrimSpace(clean)} {
+		if form != "" {
+			pairs = append(pairs, form, "[redacted]")
+		}
 	}
-	return strings.NewReplacer(code, "[redacted]", url.QueryEscape(code), "[redacted]").Replace(text)
+	return strings.NewReplacer(pairs...).Replace(text)
 }
 
-// errorText keeps only the error fields of a JSON body.
-func errorText(body []byte) string {
-	var v any
-	if json.Unmarshal(body, &v) != nil {
-		return string(body)
+func (s *Session) tokenError(msg, e, desc, code string) error {
+	detail := excerpt(s.redact(errorText(e, desc), code))
+	if detail == "" {
+		return errors.New(msg)
 	}
-	obj, _ := v.(map[string]any)
+	return fmt.Errorf("%s: %s", msg, detail)
+}
+
+func jsonString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+func errorText(e, desc string) string {
 	var parts []string
-	for _, name := range []string{"error", "error_description"} {
-		if s, ok := obj[name].(string); ok && s != "" {
-			parts = append(parts, s)
+	for _, p := range []string{e, desc} {
+		if p = strings.TrimSpace(cleanText(p)); p != "" {
+			parts = append(parts, p)
 		}
 	}
 	return strings.Join(parts, ": ")
@@ -371,7 +453,7 @@ func errorText(body []byte) string {
 
 func excerpt(s string) string {
 	if len(s) > maxExcerpt {
-		s = s[:maxExcerpt]
+		s = strings.TrimRightFunc(truncate(s, maxExcerpt), func(r rune) bool { return r == ':' || unicode.IsSpace(r) })
 	}
 	return strings.TrimSpace(s)
 }

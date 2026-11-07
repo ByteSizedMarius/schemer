@@ -4,19 +4,30 @@ import (
 	"errors"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // ErrUnsupportedOS is returned by Wait and Run on every OS but Windows.
 var ErrUnsupportedOS = errors.New("schemer: scheme registration is unimplemented on this OS")
 
 // ErrStateMismatch reports a callback whose state is not this session's.
-var ErrStateMismatch = errors.New("schemer: state mismatch")
+var ErrStateMismatch error = errStateMismatch
 
 // ErrNoCode reports a callback that carried neither a code nor an error.
-var ErrNoCode = errors.New("schemer: callback has no code")
+var ErrNoCode error = errNoCode
 
 // ErrInProgress is returned by Wait and Run while another login holds the scheme.
 var ErrInProgress = errors.New("schemer: another login for this scheme is in progress")
+
+// Unlike the exported vars, these constants cannot be reassigned by an importer.
+const (
+	errStateMismatch callbackError = "schemer: state mismatch"
+	errNoCode        callbackError = "schemer: callback has no code"
+)
+
+type callbackError string
+
+func (e callbackError) Error() string { return string(e) }
 
 // AuthError is an error the authorization server reported on the callback.
 type AuthError struct {
@@ -24,20 +35,44 @@ type AuthError struct {
 	Description string
 }
 
-// Error leaves out the control characters Code and Description may hold.
+// Byte caps on the AuthError fields built from a callback.
+const (
+	maxErrorCode        = 128
+	maxErrorDescription = 1024
+)
+
+func newAuthError(code, desc string) *AuthError {
+	return &AuthError{
+		Code:        truncate(cleanText(code), maxErrorCode),
+		Description: truncate(cleanText(desc), maxErrorDescription),
+	}
+}
+
+// Error leaves out control, format, line separator and paragraph separator runes.
 func (e *AuthError) Error() string {
-	code, desc := dropControl(e.Code), dropControl(e.Description)
+	code, desc := cleanText(e.Code), cleanText(e.Description)
 	if desc == "" {
 		return "schemer: " + code
 	}
 	return "schemer: " + code + ": " + desc
 }
 
-func dropControl(s string) string {
+func cleanText(s string) string {
 	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp) {
 			return -1
 		}
 		return r
 	}, s)
+}
+
+// truncate returns the longest whole-rune prefix of s within n bytes.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
